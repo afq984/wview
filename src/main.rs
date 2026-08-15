@@ -1,13 +1,19 @@
 use std::{path::PathBuf, sync::Arc};
 
+use std::time::{Duration, Instant};
+
 use axum::{
-    extract::{Path as UrlPath, State},
+    extract::{Path as UrlPath, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
 use clap::Parser;
+use nucleo_matcher::{
+    pattern::{CaseMatching, Normalization, Pattern},
+    Config, Matcher,
+};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use syntect::{
     easy::HighlightLines,
@@ -36,7 +42,26 @@ struct App {
     label: String,
     syntaxes: SyntaxSet,
     theme: Theme,
+    index: tokio::sync::Mutex<IndexState>,
+    // Signals cold-build completion so concurrent requests wait instead of
+    // each launching their own walk (single-flight).
+    index_ready: tokio::sync::Notify,
 }
+
+/// Cached file listing with stale-while-revalidate semantics: requests are
+/// served from the cache immediately; a background rebuild starts when it is
+/// older than INDEX_TTL. (Watch-based invalidation can replace the TTL
+/// once live updates exist.)
+#[derive(Default)]
+struct IndexState {
+    paths: Option<Arc<Vec<String>>>,
+    built: Option<Instant>,
+    refreshing: bool,
+    // Set when a cold build fails; surfaced by the next request.
+    last_error: Option<String>,
+}
+
+const INDEX_TTL: Duration = Duration::from_secs(15);
 
 type AppState = Arc<App>;
 
@@ -78,10 +103,13 @@ async fn main() -> anyhow::Result<()> {
         label,
         syntaxes: SyntaxSet::load_defaults_newlines(),
         theme: ThemeSet::load_defaults().themes["InspiredGitHub"].clone(),
+        index: tokio::sync::Mutex::new(IndexState::default()),
+        index_ready: tokio::sync::Notify::new(),
     });
 
     let router = Router::new()
         .route("/", get(files))
+        .route("/api/files", get(api_files))
         .route("/blob/{*path}", get(blob))
         .route("/web/wview.js", get(wview_js))
         .with_state(app.clone());
@@ -134,46 +162,128 @@ impl IntoResponse for AppError {
     }
 }
 
-async fn files(State(app): State<AppState>) -> Result<Html<String>, AppError> {
-    let list = tokio::task::spawn_blocking({
-        let app = app.clone();
-        move || {
-            let mut paths = Vec::new();
-            // require_git(false): honor .gitignore files even in non-git dirs
-            // (e.g. pure-jj workspaces). Hidden entries (.git, .jj, …) are
-            // skipped by the walker's defaults.
-            let walk = ignore::WalkBuilder::new(&app.root)
-                .require_git(false)
-                .build();
-            for entry in walk.flatten() {
-                if entry.file_type().is_some_and(|t| t.is_file()) {
-                    if let Ok(rel) = entry.path().strip_prefix(&app.root) {
-                        paths.push(rel.to_string_lossy().into_owned());
-                    }
+/// Walk the tree and collect sorted repo-relative file paths.
+async fn walk_files(app: AppState) -> anyhow::Result<Vec<String>> {
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        // require_git(false): honor .gitignore files even in non-git dirs
+        // (e.g. pure-jj workspaces). Hidden entries (.git, .jj, …) are
+        // skipped by the walker's defaults.
+        let walk = ignore::WalkBuilder::new(&app.root)
+            .require_git(false)
+            .build();
+        for entry in walk.flatten() {
+            if entry.file_type().is_some_and(|t| t.is_file()) {
+                if let Ok(rel) = entry.path().strip_prefix(&app.root) {
+                    paths.push(rel.to_string_lossy().into_owned());
                 }
             }
-            paths.sort();
-            paths
         }
+        paths.sort();
+        paths
     })
-    .await?;
+    .await?)
+}
 
-    let mut items = String::new();
-    for path in &list {
-        items.push_str(&format!(
-            "<li data-p=\"{p}\"><a href=\"/blob/{href}\">{p}</a></li>\n",
-            p = esc(path),
-            href = enc(path),
-        ));
+/// Rebuild the index in a detached, server-owned task: it always completes
+/// and notifies even if the request that triggered it is cancelled.
+fn spawn_index_rebuild(app: AppState) {
+    tokio::spawn(async move {
+        let built = walk_files(app.clone()).await;
+        {
+            let mut st = app.index.lock().await;
+            match built {
+                Ok(paths) => {
+                    st.paths = Some(Arc::new(paths));
+                    st.built = Some(Instant::now());
+                    st.last_error = None;
+                }
+                Err(e) => st.last_error = Some(format!("{e:#}")),
+            }
+            st.refreshing = false;
+        }
+        app.index_ready.notify_waiters();
+    });
+}
+
+/// Current file index, stale-while-revalidate (see IndexState). Builds are
+/// single-flight and detached; cold requests (including the one that starts
+/// the build) wait for completion.
+async fn file_index(app: &AppState) -> Result<Arc<Vec<String>>, AppError> {
+    loop {
+        let notified = {
+            let mut st = app.index.lock().await;
+            if let Some(paths) = st.paths.clone() {
+                let fresh = st.built.is_some_and(|t| t.elapsed() < INDEX_TTL);
+                if !fresh && !st.refreshing {
+                    st.refreshing = true;
+                    spawn_index_rebuild(app.clone());
+                }
+                return Ok(paths); // possibly stale; refresh runs detached
+            }
+            if !st.refreshing {
+                if let Some(e) = st.last_error.take() {
+                    // Previous cold build failed: surface it once; the next
+                    // request starts a fresh attempt.
+                    return Err(AppError::Other(anyhow::anyhow!(e)));
+                }
+                st.refreshing = true;
+                spawn_index_rebuild(app.clone());
+            }
+            // Register for the completion signal while still holding the
+            // lock, so the builder's notify cannot be missed.
+            let mut notified = Box::pin(app.index_ready.notified());
+            notified.as_mut().enable();
+            notified
+        };
+        notified.await;
     }
+}
 
+/// Fuzzy file search: top-N nucleo matches over the index; empty query lists
+/// the first N paths. The full list never leaves the server.
+async fn api_files(
+    State(app): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, AppError> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    let limit: usize = params
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(200)
+        .min(1000);
+
+    let paths = file_index(&app).await?;
+    let results: Vec<String> = if q.is_empty() {
+        paths.iter().take(limit).cloned().collect()
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+            let pattern = Pattern::parse(&q, CaseMatching::Ignore, Normalization::Smart);
+            pattern
+                .match_list(paths.iter(), &mut matcher)
+                .into_iter()
+                .take(limit)
+                .map(|(p, _)| p.clone())
+                .collect()
+        })
+        .await?
+    };
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&results)?,
+    )
+        .into_response())
+}
+
+async fn files(State(app): State<AppState>) -> Result<Html<String>, AppError> {
     let body = format!(
         r##"<header><strong>{label}</strong><span class="sub">{root}</span></header>
 <main>
-<input id="q" placeholder="filter files…" autofocus autocomplete="off">
+<input id="q" placeholder="find files…" autofocus autocomplete="off">
 <div id="chip" hidden></div>
-<ul id="files">
-{items}</ul>
+<ul id="files"></ul>
 <script src="/web/wview.js"></script>
 <script>const WROOT = {wroot};{shared}{index}</script>
 </main>"##,
@@ -198,21 +308,46 @@ async fn blob(
     if !full.starts_with(&app.root) {
         return Err(AppError::NotFound(path));
     }
-    if tokio::fs::metadata(&full).await?.is_dir() {
+    // Open non-blocking (a plain open of a FIFO blocks until a writer
+    // appears), then decide from the handle's metadata; the read itself is
+    // capped with take() so a file growing mid-request cannot exceed it.
+    const BLOB_MAX: u64 = 10 << 20;
+    let file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+        tokio::fs::OpenOptions::from(opts)
+            .open(&full)
+            .await
+            .map_err(|_| AppError::NotFound(path.clone()))?
+    };
+    let meta = file.metadata().await?;
+    if meta.is_dir() {
         return Ok(Redirect::temporary(&format!("/?q={}/", enc(&path))).into_response());
     }
-
-    // TODO: unbounded read — open the file, require a regular file (a FIFO here
-    // blocks forever), and cap the bytes read/rendered (the 1 MiB limit below
-    // only skips highlighting, not the read or the HTML).
-    let bytes = tokio::fs::read(&full).await?;
-    let content = match String::from_utf8(bytes) {
-        Ok(text) if text.is_empty() => "<p class=\"note\">empty file</p>".to_string(),
-        Ok(text) => render_code(&app, &path, &text),
-        Err(e) => format!(
-            "<p class=\"note\">binary file ({} bytes)</p>",
-            e.as_bytes().len()
-        ),
+    if !meta.is_file() {
+        return Err(AppError::NotFound(path));
+    }
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut tokio::io::AsyncReadExt::take(file, BLOB_MAX + 1),
+        &mut bytes,
+    )
+    .await?;
+    let content = if bytes.len() as u64 > BLOB_MAX {
+        format!(
+            "<p class=\"note\">file too large to display ({} bytes)</p>",
+            meta.len().max(bytes.len() as u64)
+        )
+    } else {
+        match String::from_utf8(bytes) {
+            Ok(text) if text.is_empty() => "<p class=\"note\">empty file</p>".to_string(),
+            Ok(text) => render_code(&app, &path, &text),
+            Err(e) => format!(
+                "<p class=\"note\">binary file ({} bytes)</p>",
+                e.as_bytes().len()
+            ),
+        }
     };
 
     let body = format!(
@@ -418,26 +553,43 @@ async function copyText(text, btn) {
 const INDEX_JS: &str = r#"
 (() => {
   const q = document.getElementById('q');
-  const items = [...document.querySelectorAll('#files li')];
-  function apply() {
-    const v = q.value.toLowerCase();
-    for (const li of items) li.style.display = li.dataset.p.toLowerCase().includes(v) ? '' : 'none';
-  }
-  q.addEventListener('input', apply);
-  q.value = new URLSearchParams(location.search).get('q') || '';
-  apply();
-
+  const list = document.getElementById('files');
   const entries = allEntries();
   const counts = new Map(entries.map(e => [e.path, e.comments.length]));
-  for (const li of items) {
-    const n = counts.get(li.dataset.p);
-    if (n) {
-      const b = document.createElement('span');
-      b.className = 'badge';
-      b.textContent = '💬 ' + n;
-      li.appendChild(b);
+
+  let seq = 0;
+  async function refresh() {
+    const cur = ++seq;
+    let paths;
+    try {
+      const res = await fetch('/api/files?q=' + encodeURIComponent(q.value));
+      if (!res.ok) throw new Error(res.status);
+      paths = await res.json();
+    } catch {
+      return;
+    }
+    if (cur !== seq) return; // a newer query superseded this one
+    list.textContent = '';
+    for (const p of paths) {
+      const li = document.createElement('li');
+      const a = document.createElement('a');
+      a.href = '/blob/' + p.split('/').map(encodeURIComponent).join('/');
+      a.textContent = p;
+      li.appendChild(a);
+      const n = counts.get(p);
+      if (n) {
+        const b = document.createElement('span');
+        b.className = 'badge';
+        b.textContent = '💬 ' + n;
+        li.appendChild(b);
+      }
+      list.appendChild(li);
     }
   }
+  q.addEventListener('input', refresh);
+  q.value = new URLSearchParams(location.search).get('q') || '';
+  refresh();
+
   const total = entries.reduce((s, e) => s + e.comments.length, 0);
   if (!total) return;
   const chip = document.getElementById('chip');

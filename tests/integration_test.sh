@@ -32,9 +32,25 @@ for _ in $(seq 1 50); do
 done
 test -n "$BASE"
 
-curl -fsS "$BASE/" | grep -q 'data-p="f.py"'
-curl -fsS "$BASE/" | grep -q 'data-p="sub/lib.rs"'
 curl -fsS "$BASE/blob/f.py" | grep -q 'id="L1"'
+
+# The index page is a shell: file paths come from /api/files, never inline.
+mkdir -p "$FIXTURE/gen"
+touch "$FIXTURE"/gen/file_{1..500}.txt
+head -c $((11 << 20)) /dev/zero | tr '\0' 'a' > "$FIXTURE/big.txt"
+INDEX_BODY=$(curl -fsS "$BASE/")
+[[ "$INDEX_BODY" != *file_250.txt* ]]
+[[ "$INDEX_BODY" != *'data-p'* ]]
+# Fuzzy search finds it server-side (index refresh may lag one TTL; the
+# fixture was fully written before the first request, so it is present).
+curl -fsS "$BASE/api/files?q=file250txt" | grep -q 'gen/file_250.txt'
+curl -fsS "$BASE/api/files?q=" | grep -q '"f.py"'
+# Oversized files are capped, not read into memory.
+curl -fsS "$BASE/blob/big.txt" | grep -q 'file too large'
+# A FIFO must 404 promptly, not hang the request in open().
+mkfifo "$FIXTURE/pipe"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/blob/pipe")
+test "$STATUS" = 404
 # Embedded vite-built bundle is served and referenced by pages.
 curl -fsS "$BASE/web/wview.js" | grep -q 'wviewComments'
 curl -fsS "$BASE/blob/f.py" | grep -q 'src="/web/wview.js"'

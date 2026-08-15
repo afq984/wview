@@ -1,6 +1,16 @@
 load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+exports_files(["Cargo.toml"])
+
+# CARGO_PKG_* for rustc; without this rules_rust defaults the package version
+# to 0.0.0 and `wview --version` lies.
+cargo_toml_env_vars(
+    name = "cargo_env",
+    src = "Cargo.toml",
+)
 
 rust_binary(
     name = "wview",
@@ -11,6 +21,7 @@ rust_binary(
     compile_data = ["//web:bundle_js"],
     edition = "2021",
     rustc_env = {"WVIEW_JS": "$(execpath //web:bundle_js)"},
+    rustc_env_files = [":cargo_env"],
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True),
 )
@@ -21,6 +32,7 @@ rust_test(
     compile_data = ["//web:bundle_js"],
     crate = ":wview",
     rustc_env = {"WVIEW_JS": "$(execpath //web:bundle_js)"},
+    rustc_env_files = [":cargo_env"],
 )
 
 sh_test(
@@ -29,5 +41,8 @@ sh_test(
     srcs = ["tests/integration_test.sh"],
     # Needs host bash/coreutils/curl — accepted host tools alongside the C
     # toolchain.
-    data = [":wview"],
+    data = [
+        "Cargo.toml",
+        ":wview",
+    ],
 )

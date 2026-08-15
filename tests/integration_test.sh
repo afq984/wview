@@ -5,6 +5,12 @@ set -euo pipefail
 
 BIN="$TEST_SRCDIR/$TEST_WORKSPACE/wview"
 
+"$BIN" --help | grep -q '^Usage: wview \[ROOT\] \[PORT\]$'
+# --version must report the Cargo.toml version, not rules_rust's 0.0.0 default.
+VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$TEST_SRCDIR/$TEST_WORKSPACE/Cargo.toml")
+test -n "$VERSION"
+"$BIN" --version | grep -qx "wview $VERSION"
+
 FIXTURE="$TEST_TMPDIR/fixture"
 mkdir -p "$FIXTURE/sub"
 printf 'def foo():\n    pass\n' > "$FIXTURE/f.py"

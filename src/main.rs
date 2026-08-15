@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Router,
 };
+use clap::Parser;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use syntect::{
     easy::HighlightLines,
@@ -15,6 +16,20 @@ use syntect::{
     parsing::SyntaxSet,
     util::LinesWithEndings,
 };
+
+/// Local web code browser: serves a directory tree with syntax highlighting
+/// and gerrit-style line comments, reviewer-first.
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Directory to serve
+    #[arg(default_value = ".")]
+    root: String,
+
+    /// Port to listen on; 0 picks an ephemeral port
+    #[arg(default_value_t = 8484)]
+    port: u16,
+}
 
 struct App {
     root: PathBuf,
@@ -48,14 +63,10 @@ const HREF_ENC: &AsciiSet = &CONTROLS
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let root = args.next().unwrap_or_else(|| ".".into());
-    let port: u16 = match args.next() {
-        Some(p) => p.parse()?,
-        None => 8484,
-    };
+    let args = Args::parse();
+    let port = args.port;
 
-    let root = std::fs::canonicalize(&root)?;
+    let root = std::fs::canonicalize(&args.root)?;
     anyhow::ensure!(root.is_dir(), "{}: not a directory", root.display());
     let label = root
         .file_name()
@@ -665,5 +676,14 @@ mod tests {
     #[test]
     fn bundle_is_embedded() {
         assert!(!WVIEW_JS.is_empty());
+    }
+
+    #[test]
+    fn cli_defaults_and_positionals() {
+        let a = Args::try_parse_from(["wview"]).unwrap();
+        assert_eq!((a.root.as_str(), a.port), (".", 8484));
+        let a = Args::try_parse_from(["wview", "/tmp", "0"]).unwrap();
+        assert_eq!((a.root.as_str(), a.port), ("/tmp", 0));
+        assert!(Args::try_parse_from(["wview", "/tmp", "notaport"]).is_err());
     }
 }

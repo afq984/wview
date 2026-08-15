@@ -819,8 +819,10 @@ const BLOB_JS: &str = r#"
     const r = selectedRange();
     if (!r) return;
     e.preventDefault();
-    openEditor(r[0], r[1]);
+    // Clear the selection before opening: clearing after would strip the
+    // caret from the freshly focused textarea.
     getSelection()?.removeAllRanges();
+    openEditor(r[0], r[1]);
   });
 
   renderAll();

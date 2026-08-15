@@ -18,6 +18,7 @@ test('comment on a line, persist, and copy in the export format', async ({ page,
   await page.click('#L1 a');
   await page.keyboard.press('c');
   const editor = page.locator('tr.cedit textarea');
+  await expect(editor).toBeFocused();
   await editor.fill('please add a docstring');
   await editor.press('Control+Enter');
   await expect(page.locator('tr.cmt .body')).toHaveText('please add a docstring');
@@ -81,6 +82,31 @@ test('deleting another comment while editing keeps the editor swapped in', async
   await ta.press('Control+Enter');
   await expect(page.locator('tr.cmt .body')).toHaveText('first revised');
   await expect(page.locator('tr.cmt')).toHaveCount(1);
+});
+
+test('c on a drag selection opens a focused editor', async ({ page, server }) => {
+  await page.goto(`${server.baseURL}/blob/f.py`);
+  const from = await page.locator('#L1 td.c').boundingBox();
+  const to = await page.locator('#L2 td.c').boundingBox();
+  if (!from || !to) throw new Error('missing line boxes');
+  await page.mouse.move(from.x + 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 8 });
+  await page.mouse.up();
+  await page.keyboard.press('c');
+
+  const editor = page.locator('tr.cedit textarea');
+  await expect(editor).toBeFocused();
+  // Type through the keyboard: if focus were elsewhere, the 'c' in
+  // "comment" would re-trigger the shortcut instead of landing here.
+  await page.keyboard.type('range comment');
+  await expect(editor).toHaveValue('range comment');
+  await page.keyboard.press('Control+Enter');
+  await expect(page.locator('tr.cmt .body')).toHaveText('range comment');
+
+  await page.locator('tr.cmt button', { hasText: 'copy' }).click();
+  const clip = await page.evaluate(() => navigator.clipboard.readText());
+  expect(clip).toBe('f.py:1:\n> def foo():\n>     pass\nrange comment');
 });
 
 test('text selection skips comment UI', async ({ page, server }) => {

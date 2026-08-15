@@ -18,6 +18,9 @@ export const test = base.extend<{}, { server: WviewServer }>({
       await writeFile(join(root, 'f.py'), 'def foo():\n    pass\n');
       await mkdir(join(root, 'sub'), { recursive: true });
       await writeFile(join(root, 'sub', 'lib.rs'), 'fn main() {}\n');
+      // Tall file: overflows the viewport for scroll-behavior tests.
+      const many = Array.from({ length: 200 }, (_, i) => `x${i + 1} = ${i + 1}`).join('\n');
+      await writeFile(join(root, 'many.py'), many + '\n');
 
       const bin = process.env.WVIEW_BIN ?? join('..', 'bazel-bin', 'wview');
       const proc = spawn(bin, [root, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });

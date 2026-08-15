@@ -486,8 +486,12 @@ table.code td { padding: 0 10px; vertical-align: top; }
 td.ln { text-align: right; color: #8c959f; user-select: none; white-space: nowrap; }
 td.ln a { color: inherit; }
 td.c { white-space: pre; }
-tr:target { background: #fff8c5; }
-tr:target td.ln { color: #1f2328; }
+/* Highlight is class-driven (mirrored from the hash by JS) rather than
+   :target: line-marker clicks update the hash via replaceState to avoid the
+   native anchor scroll, and :target neither updates under replaceState nor
+   clears once stale. */
+tr.ltarget { background: #fff8c5; }
+tr.ltarget td.ln { color: #1f2328; }
 tr.crange td { background: #ddf4ff; }
 p.note { color: #59636e; font-style: italic; }
 button { font: 12px system-ui; padding: 2px 8px; border: 1px solid #d1d9e0;
@@ -663,6 +667,27 @@ const BLOB_JS: &str = r#"
   function markRange(s, e, on) {
     for (let n = s; n <= e; n++) rowOf(n)?.classList.toggle('crange', on);
   }
+
+  function applyHash() {
+    for (const el of tbl.querySelectorAll('tr.ltarget')) el.classList.remove('ltarget');
+    const m = /^#L(\d+)$/.exec(location.hash);
+    if (m) rowOf(+m[1])?.classList.add('ltarget');
+  }
+
+  // Clicking a line marker anchors the line without the native scroll jump:
+  // update the hash via replaceState and mirror the highlight ourselves.
+  // Loading a #L… permalink still scrolls natively, and modified clicks
+  // (new tab etc.) keep normal link behavior.
+  tbl.addEventListener('click', e => {
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    const a = e.target instanceof Element && e.target.closest('td.ln a');
+    if (!a) return;
+    e.preventDefault();
+    history.replaceState(null, '', a.getAttribute('href'));
+    applyHash();
+  });
+  window.addEventListener('hashchange', applyHash);
+  applyHash();
 
   function closeEditor() {
     if (!editor) return;

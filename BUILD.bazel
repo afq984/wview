@@ -5,7 +5,12 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 rust_binary(
     name = "wview",
     srcs = ["src/main.rs"],
+    # The vite-built bundle is a compile-time input: src/main.rs embeds it via
+    # include_bytes!(env!("WVIEW_JS")). rules_rust expands $(execpath) in
+    # rustc_env to an absolute path inside the rustc action's sandbox.
+    compile_data = ["//web:bundle_js"],
     edition = "2021",
+    rustc_env = {"WVIEW_JS": "$(execpath //web:bundle_js)"},
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True),
 )
@@ -13,7 +18,9 @@ rust_binary(
 rust_test(
     name = "wview_unit",
     size = "small",
+    compile_data = ["//web:bundle_js"],
     crate = ":wview",
+    rustc_env = {"WVIEW_JS": "$(execpath //web:bundle_js)"},
 )
 
 sh_test(

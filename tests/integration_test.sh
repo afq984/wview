@@ -27,6 +27,9 @@ done
 curl -fsS "$BASE/" | grep -q 'data-p="f.py"'
 curl -fsS "$BASE/" | grep -q 'data-p="sub/lib.rs"'
 curl -fsS "$BASE/blob/f.py" | grep -q 'id="L1"'
+# Embedded vite-built bundle is served and referenced by pages.
+curl -fsS "$BASE/web/wview.js" | grep -q 'wviewComments'
+curl -fsS "$BASE/blob/f.py" | grep -q 'src="/web/wview.js"'
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$BASE/blob/../outside")
 test "$STATUS" = 404
 BODY=$(curl -s --path-as-is "$BASE/blob/../outside")

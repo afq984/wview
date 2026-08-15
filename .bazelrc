@@ -1,0 +1,4 @@
+# aspect_rules_js pulls in aspect_tools_telemetry, which POSTs build metadata
+# to a third party by default. Off. (--repo_env because a repository rule
+# reads it; the module also honors DO_NOT_TRACK.)
+common --repo_env=ASPECT_TOOLS_TELEMETRY=-all

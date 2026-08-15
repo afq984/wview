@@ -1,0 +1,74 @@
+load("@aspect_bazel_lib//lib:copy_file.bzl", "copy_file")
+load("@aspect_bazel_lib//lib:directory_path.bzl", "directory_path")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//web:typescript/package_json.bzl", typescript_bin = "bin")
+load("@npm//web:vite/package_json.bzl", vite_bin = "bin")
+load("@npm//web:vitest/package_json.bzl", vitest_bin = "bin")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+# Production bundle, equivalent to `pnpm run build` (vite lib build with a
+# stable wview.js output name).
+vite_bin.vite(
+    name = "dist",
+    srcs = [
+        "package.json",
+        "src/comments.ts",
+        "tsconfig.json",
+        "vite.config.ts",
+        ":node_modules",
+    ],
+    args = ["build"],
+    chdir = package_name(),
+    out_dirs = ["dist"],
+)
+
+directory_path(
+    name = "wview_js_path",
+    directory = ":dist",
+    path = "wview.js",
+)
+
+# Single-file handle for the Rust embed step's $(execpath).
+copy_file(
+    name = "bundle_js",
+    src = ":wview_js_path",
+    out = "wview_bundle.js",
+    visibility = ["//visibility:public"],
+)
+
+# Vite and Vitest only transpile; tsc is what actually enforces the types.
+typescript_bin.tsc_test(
+    name = "typecheck",
+    size = "small",
+    args = ["-p", "."],
+    chdir = package_name(),
+    data = [
+        "package.json",
+        "src/comments.test.ts",
+        "src/comments.ts",
+        "tsconfig.json",
+        ":node_modules",
+    ],
+)
+
+vitest_bin.vitest_test(
+    name = "unit",
+    size = "small",
+    args = ["run"],
+    chdir = package_name(),
+    data = [
+        "package.json",
+        "src/comments.test.ts",
+        "src/comments.ts",
+        "tsconfig.json",
+        "vite.config.ts",
+        ":node_modules",
+    ],
+)

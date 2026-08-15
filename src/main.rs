@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let router = Router::new()
         .route("/", get(files))
         .route("/blob/{*path}", get(blob))
+        .route("/web/wview.js", get(wview_js))
         .with_state(app.clone());
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -79,6 +80,19 @@ async fn main() -> anyhow::Result<()> {
     println!("wview: {} at http://{addr}/", app.root.display());
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+// Vite-built frontend bundle (web/), embedded at compile time; see BUILD.bazel.
+const WVIEW_JS: &[u8] = include_bytes!(env!(
+    "WVIEW_JS",
+    "WVIEW_JS is set by the Bazel build; build with bazel, not cargo"
+));
+
+async fn wview_js() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+        WVIEW_JS,
+    )
 }
 
 enum AppError {
@@ -143,6 +157,7 @@ async fn files(State(app): State<AppState>) -> Result<Html<String>, AppError> {
 <div id="chip" hidden></div>
 <ul id="files">
 {items}</ul>
+<script src="/web/wview.js"></script>
 <script>const WROOT = {wroot};{shared}{index}</script>
 </main>"##,
         label = esc(&app.label),
@@ -186,6 +201,7 @@ async fn blob(
     let body = format!(
         r#"<header>{crumbs}<span class="sub">select code, press c to comment</span><button id="copyall" hidden></button></header>
 <main>{content}
+<script src="/web/wview.js"></script>
 <script>const WROOT = {wroot};{shared}{blob}</script>
 </main>"#,
         crumbs = breadcrumbs(&app.label, &path),
@@ -371,16 +387,6 @@ function allEntries() {
   es.sort((a, b) => (a.path < b.path ? -1 : 1));
   return es;
 }
-function fmtOne(path, c) {
-  return path + ':' + c.start + ':\n' + c.quoted.map(l => '> ' + l).join('\n') + '\n' + c.body;
-}
-function fmtAll(entries) {
-  const parts = [];
-  for (const e of entries)
-    for (const c of [...e.comments].sort((a, b) => a.start - b.start || a.end - b.end))
-      parts.push(fmtOne(e.path, c));
-  return parts.join('\n\n');
-}
 async function copyText(text, btn) {
   let ok = true;
   try { await navigator.clipboard.writeText(text); } catch { ok = false; }
@@ -422,7 +428,7 @@ const INDEX_JS: &str = r#"
   chip.append(total + ' comment' + (total === 1 ? '' : 's'));
   const copy = document.createElement('button');
   copy.textContent = 'copy all';
-  copy.addEventListener('click', () => copyText(fmtAll(entries), copy));
+  copy.addEventListener('click', () => copyText(wviewComments.fmtAll(entries), copy));
   const clear = document.createElement('button');
   clear.textContent = 'discard all';
   clear.addEventListener('click', () => {
@@ -446,7 +452,7 @@ const BLOB_JS: &str = r#"
       'copy ' + comments.length + ' comment' + (comments.length === 1 ? '' : 's');
   }
   copyAllBtn.addEventListener('click', () =>
-    copyText(fmtAll([{ path: PATH, comments }]), copyAllBtn));
+    copyText(wviewComments.fmtAll([{ path: PATH, comments }]), copyAllBtn));
   updateCopyAll();
 
   // Binary/empty views keep copy-all above but have no code table to annotate.
@@ -560,7 +566,7 @@ const BLOB_JS: &str = r#"
     where.textContent = 'L' + c.start + (c.end > c.start ? '-' + c.end : '');
     const copy = document.createElement('button');
     copy.textContent = 'copy';
-    copy.addEventListener('click', () => copyText(fmtOne(PATH, c), copy));
+    copy.addEventListener('click', () => copyText(wviewComments.fmtOne(PATH, c), copy));
     const edit = document.createElement('button');
     edit.textContent = 'edit';
     edit.addEventListener('click', () => openEditor(c.start, c.end, c, row));
@@ -648,5 +654,10 @@ mod tests {
     #[test]
     fn enc_keeps_slashes_literal() {
         assert_eq!(enc("a b/c"), "a%20b/c");
+    }
+
+    #[test]
+    fn bundle_is_embedded() {
+        assert!(!WVIEW_JS.is_empty());
     }
 }

@@ -1,0 +1,4 @@
+# Consumed by rules_js via npm_translate_lock. Only listed packages may run
+# install lifecycle scripts.
+allowBuilds:
+  esbuild: true

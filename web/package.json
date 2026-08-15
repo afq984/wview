@@ -11,6 +11,8 @@
   "devDependencies": {
     "typescript": "^5.7.0",
     "vite": "^7",
-    "vitest": "^3"
+    "vitest": "^3",
+    "@playwright/test": "1.56.0",
+    "@types/node": "^22"
   }
 }

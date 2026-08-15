@@ -1,11 +1,15 @@
 load("@aspect_bazel_lib//lib:copy_file.bzl", "copy_file")
+load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
+load("@aspect_bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@aspect_bazel_lib//lib:directory_path.bzl", "directory_path")
 load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//web:@playwright/test/package_json.bzl", playwright_bin = "bin")
 load("@npm//web:typescript/package_json.bzl", typescript_bin = "bin")
 load("@npm//web:vite/package_json.bzl", vite_bin = "bin")
 load("@npm//web:vitest/package_json.bzl", vitest_bin = "bin")
 
 exports_files([
+    "browsers.json",
     "package.json",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
@@ -13,15 +17,27 @@ exports_files([
 
 npm_link_all_packages(name = "node_modules")
 
+# Shared bin copies. Files consumed by several js targets must be copied to
+# bazel-out by ONE owner: :e2e's no-sandbox tag propagates to its implicit
+# copy actions, which would otherwise conflict with the untagged copies of
+# the same files made by :dist/:unit/:typecheck.
+copy_to_bin(
+    name = "config_bin",
+    srcs = [
+        "package.json",
+        "playwright.config.ts",
+    ],
+)
+
 # Production bundle, equivalent to `pnpm run build` (vite lib build with a
 # stable wview.js output name).
 vite_bin.vite(
     name = "dist",
     srcs = [
-        "package.json",
         "src/comments.ts",
         "tsconfig.json",
         "vite.config.ts",
+        ":config_bin",
         ":node_modules",
     ],
     args = ["build"],
@@ -50,11 +66,56 @@ typescript_bin.tsc_test(
     args = ["-p", "."],
     chdir = package_name(),
     data = [
-        "package.json",
-        "src/comments.test.ts",
-        "src/comments.ts",
         "tsconfig.json",
+        ":config_bin",
         ":node_modules",
+    ] + glob([
+        "src/**/*.ts",
+        "tests/**/*.ts",
+    ]),
+)
+
+# Runfiles link each file individually, and Playwright's test scanner does not
+# follow symlinked files — collection finds nothing. Materializing the specs
+# as one directory artifact gives it real files to scan.
+copy_to_directory(
+    name = "e2e_tests",
+    srcs = glob(["tests/**/*.ts"]),
+    root_paths = ["web/tests"],
+)
+
+playwright_bin.playwright_test(
+    name = "e2e",
+    size = "small",
+    args = ["test"],
+    chdir = package_name(),
+    # rules_js patches Node's fs so symlinked packages appear resolved in
+    # place; Playwright's own loader hooks then see specs twice ("did not
+    # expect test.describe() to be called here").
+    patch_node_fs = False,
+    data = [
+        # The specific package link, not the whole :node_modules tree, or the
+        # runner gets a second @playwright/test instance.
+        ":config_bin",
+        ":e2e_tests",
+        ":node_modules/@playwright/test",
+        "//:wview",
+        "@playwright//:chromium-headless-shell",
+    ],
+    env = {
+        "CI": "1",
+        # chdir is web/, one level below the runfiles root.
+        "PLAYWRIGHT_BROWSERS_PATH": "../$(rootpath @playwright//:chromium-headless-shell)/..",
+        "PLAYWRIGHT_TEST_DIR": "e2e_tests",
+        "WVIEW_BIN": "../$(rootpath //:wview)",
+    },
+    tags = [
+        # Inputs are not fully declared without the sandbox (node resolves
+        # through runfiles symlinks), so never memoise the verdict.
+        "external",
+        # Playwright's discovery finds nothing inside the sandbox; upstream
+        # tags its browser tests the same way.
+        "no-sandbox",
     ],
 )
 
@@ -64,11 +125,11 @@ vitest_bin.vitest_test(
     args = ["run"],
     chdir = package_name(),
     data = [
-        "package.json",
         "src/comments.test.ts",
         "src/comments.ts",
         "tsconfig.json",
         "vite.config.ts",
+        ":config_bin",
         ":node_modules",
     ],
 )

@@ -29,6 +29,26 @@ crate.from_cargo(
 )
 use_repo(crate, "crates")
 
+# Playwright browsers, fetched by Bazel rather than a post-install step.
+# Pinned below 1.57: rules_playwright 0.5.3 only generates the legacy
+# builds/chromium/<revision>/ download paths, which stop resolving for 1.57+
+# on x64. browsers.json is vendored so the browser revision is a committed
+# input rather than an unhashed remote fetch.
+bazel_dep(name = "rules_playwright", version = "0.5.3")
+
+playwright = use_extension("@rules_playwright//playwright:extensions.bzl", "playwright")
+playwright.repo(
+    name = "playwright",
+    browsers_json = "//web:browsers.json",
+    # rules_playwright 0.5.3 ships no integrity for revision 1194, so pin the
+    # archive this project actually fetches (verified via Bazel's canonical
+    # integrity report). Other platforms: add their hash on first use.
+    integrity_path_map = {
+        "builds/chromium/1194/chromium-headless-shell-linux.zip": "sha256-10XHIQzIi3PHmRoiyWJIGZYNhLw953rHM20t6EGoyR8=",
+    },
+)
+use_repo(playwright, "playwright")
+
 npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
 npm.npm_translate_lock(
     name = "npm",

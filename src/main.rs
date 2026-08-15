@@ -496,6 +496,11 @@ button:hover { background: #eef1f4; }
 #chip { display: flex; gap: 8px; align-items: center; margin-bottom: 8px;
         color: #59636e; font-size: 13px; }
 .badge { margin-left: 8px; color: #59636e; font-size: 12px; }
+/* Comment UI is invisible to text selection: dragging across code skips it,
+   and copied selections contain only code. The comment's own copy button is
+   the sanctioned way to copy a comment. */
+tr.cmt td, tr.cedit td { user-select: none; }
+tr.cedit textarea { user-select: text; }
 .cbox { max-width: 720px; margin: 4px 0; padding: 6px 10px;
         border: 1px solid #d1d9e0; border-radius: 6px; background: #f6f8fa;
         font: 13px/1.5 system-ui, sans-serif; }
@@ -662,6 +667,7 @@ const BLOB_JS: &str = r#"
   function closeEditor() {
     if (!editor) return;
     markRange(editor.start, editor.end, false);
+    if (editor.restore) editor.restore.hidden = false;
     editor.row.remove();
     editor = null;
   }
@@ -716,7 +722,9 @@ const BLOB_JS: &str = r#"
     td.append(ta, save, cancel);
     row.appendChild(td);
     ref.after(row);
-    editor = { row, start, end };
+    // Editing replaces the comment's display until save/cancel.
+    if (anchor) anchor.hidden = true;
+    editor = { row, start, end, restore: anchor || null, editingId: existing ? existing.id : null };
     markRange(start, end, true);
     ta.focus();
   }
@@ -725,6 +733,7 @@ const BLOB_JS: &str = r#"
     const row = document.createElement('tr');
     row.className = 'cmt';
     row.dataset.cend = c.end;
+    row.dataset.cid = c.id;
     const td = document.createElement('td');
     td.colSpan = 2;
     const box = document.createElement('div');
@@ -779,6 +788,18 @@ const BLOB_JS: &str = r#"
         ref = row;
       }
       if (!anchor) orphanRef = ref;
+    }
+    // A rerender may run mid-edit (e.g. deleting another comment). Keep the
+    // edited comment's fresh display row swapped out for the editor — or
+    // close the editor if the comment itself is gone.
+    if (editor && editor.editingId) {
+      const row = tbl.querySelector('tr.cmt[data-cid="' + editor.editingId + '"]');
+      if (row) {
+        row.hidden = true;
+        editor.restore = row;
+      } else {
+        closeEditor();
+      }
     }
     updateCopyAll();
   }

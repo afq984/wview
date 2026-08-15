@@ -27,8 +27,7 @@ sh_test(
     name = "integration",
     size = "small",
     srcs = ["tests/integration_test.sh"],
+    # Needs host bash/coreutils/curl — accepted host tools alongside the C
+    # toolchain.
     data = [":wview"],
-    # Binds a fixed localhost port; needs host bash/coreutils/curl — accepted
-    # host tools alongside the C toolchain.
-    tags = ["exclusive"],
 )

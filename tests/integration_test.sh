@@ -4,8 +4,6 @@
 set -euo pipefail
 
 BIN="$TEST_SRCDIR/$TEST_WORKSPACE/wview"
-PORT=18997
-BASE="http://127.0.0.1:$PORT"
 
 FIXTURE="$TEST_TMPDIR/fixture"
 mkdir -p "$FIXTURE/sub"
@@ -15,14 +13,18 @@ printf 'fn main() {}\n' > "$FIXTURE/sub/lib.rs"
 # confinement check, not on canonicalization.
 printf 'secret\n' > "$TEST_TMPDIR/outside"
 
-"$BIN" "$FIXTURE" "$PORT" &
+# Port 0: the server picks an ephemeral port and prints the bound address.
+"$BIN" "$FIXTURE" 0 > "$TEST_TMPDIR/server.log" &
 SERVER=$!
 trap 'kill "$SERVER" 2>/dev/null || true' EXIT
 
+BASE=""
 for _ in $(seq 1 50); do
-  if curl -fsS "$BASE/" >/dev/null 2>&1; then break; fi
+  BASE=$(sed -n 's|^wview: .* at \(http://[0-9.:]*\)/$|\1|p' "$TEST_TMPDIR/server.log")
+  if [ -n "$BASE" ] && curl -fsS "$BASE/" >/dev/null 2>&1; then break; fi
   sleep 0.1
 done
+test -n "$BASE"
 
 curl -fsS "$BASE/" | grep -q 'data-p="f.py"'
 curl -fsS "$BASE/" | grep -q 'data-p="sub/lib.rs"'

@@ -77,7 +77,13 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("wview: {} at http://{addr}/", app.root.display());
+    // Port 0 binds an ephemeral port; print the actual address so callers
+    // (tests, scripts) can parse it.
+    println!(
+        "wview: {} at http://{}/",
+        app.root.display(),
+        listener.local_addr()?
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }

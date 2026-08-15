@@ -630,3 +630,23 @@ const BLOB_JS: &str = r#"
   renderAll();
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn esc_escapes_html() {
+        assert_eq!(esc("<a & \"b\">"), "&lt;a &amp; &quot;b&quot;&gt;");
+    }
+
+    #[test]
+    fn js_str_quotes_for_inline_script() {
+        assert_eq!(js_str("a\"b\\c<"), "\"a\\\"b\\\\c\\u003C\"");
+    }
+
+    #[test]
+    fn enc_keeps_slashes_literal() {
+        assert_eq!(enc("a b/c"), "a%20b/c");
+    }
+}

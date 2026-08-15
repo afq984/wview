@@ -1,0 +1,27 @@
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+rust_binary(
+    name = "wview",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "wview_unit",
+    size = "small",
+    crate = ":wview",
+)
+
+sh_test(
+    name = "integration",
+    size = "small",
+    srcs = ["tests/integration_test.sh"],
+    data = [":wview"],
+    # Binds a fixed localhost port; needs host bash/coreutils/curl — accepted
+    # host tools alongside the C toolchain.
+    tags = ["exclusive"],
+)

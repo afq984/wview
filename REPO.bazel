@@ -1,0 +1,6 @@
+# Build outputs of other tools living inside the workspace. Bazel 9 requires
+# ignoring them explicitly or their churn invalidates the build graph.
+ignore_directories([
+    "target",
+    "**/node_modules",
+])

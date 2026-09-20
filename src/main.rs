@@ -2,6 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use axum::{
     extract::{Path as UrlPath, Query, State},
     http::StatusCode,
@@ -12,7 +14,7 @@ use axum::{
 use clap::Parser;
 use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
-    Config, Matcher,
+    Config, Matcher, Utf32Str,
 };
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use syntect::{
@@ -46,6 +48,9 @@ struct App {
     // Signals cold-build completion so concurrent requests wait instead of
     // each launching their own walk (single-flight).
     index_ready: tokio::sync::Notify,
+    // Monotonic sequence number for search queries; newer queries cancel older
+    // in-flight scans across the index.
+    search_seq: AtomicU64,
 }
 
 /// Cached file listing with stale-while-revalidate semantics: requests are
@@ -105,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         theme: ThemeSet::load_defaults().themes["InspiredGitHub"].clone(),
         index: tokio::sync::Mutex::new(IndexState::default()),
         index_ready: tokio::sync::Notify::new(),
+        search_seq: AtomicU64::new(0),
     });
 
     let router = Router::new()
@@ -162,24 +168,97 @@ impl IntoResponse for AppError {
     }
 }
 
-/// Walk the tree and collect sorted repo-relative file paths.
+/// Walk the tree in parallel and collect sorted repo-relative file paths.
 async fn walk_files(app: AppState) -> anyhow::Result<Vec<String>> {
     Ok(tokio::task::spawn_blocking(move || {
-        let mut paths = Vec::new();
-        // require_git(false): honor .gitignore files even in non-git dirs
-        // (e.g. pure-jj workspaces). Hidden entries (.git, .jj, …) are
-        // skipped by the walker's defaults.
-        let walk = ignore::WalkBuilder::new(&app.root)
-            .require_git(false)
-            .build();
-        for entry in walk.flatten() {
-            if entry.file_type().is_some_and(|t| t.is_file()) {
-                if let Ok(rel) = entry.path().strip_prefix(&app.root) {
-                    paths.push(rel.to_string_lossy().into_owned());
+        struct BatchCollector<'a> {
+            local: Vec<String>,
+            batches: &'a std::sync::Mutex<Vec<Vec<String>>>,
+        }
+        impl Drop for BatchCollector<'_> {
+            fn drop(&mut self) {
+                if !self.local.is_empty() {
+                    self.batches
+                        .lock()
+                        .unwrap()
+                        .push(std::mem::take(&mut self.local));
                 }
             }
         }
-        paths.sort();
+
+        let batches: std::sync::Mutex<Vec<Vec<String>>> = std::sync::Mutex::new(Vec::new());
+        let root = &app.root;
+        // require_git(false): honor .gitignore files even in non-git dirs
+        // (e.g. pure-jj workspaces). Hidden entries (.git, .jj, …) are
+        // skipped by the walker's defaults.
+        ignore::WalkBuilder::new(root)
+            .require_git(false)
+            .build_parallel()
+            .run(|| {
+                let mut collector = BatchCollector {
+                    local: Vec::with_capacity(4096),
+                    batches: &batches,
+                };
+                Box::new(move |entry| {
+                    if let Ok(entry) = entry {
+                        if entry.file_type().is_some_and(|t| t.is_file()) {
+                            if let Ok(rel) = entry.path().strip_prefix(root) {
+                                collector.local.push(rel.to_string_lossy().into_owned());
+                                if collector.local.len() >= 4096 {
+                                    collector
+                                        .batches
+                                        .lock()
+                                        .unwrap()
+                                        .push(std::mem::replace(
+                                            &mut collector.local,
+                                            Vec::with_capacity(4096),
+                                        ));
+                                }
+                            }
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+
+        let batches = batches.into_inner().unwrap();
+        let total: usize = batches.iter().map(Vec::len).sum();
+        // Partition by leading UTF-8 byte (str Ord is lexicographical on bytes)
+        // and sort the 256 buckets in parallel across worker threads.
+        let mut buckets: Vec<Vec<String>> = (0..256).map(|_| Vec::new()).collect();
+        for batch in batches {
+            for p in batch {
+                let b = p.as_bytes().first().copied().unwrap_or(0) as usize;
+                buckets[b].push(p);
+            }
+        }
+        let next_bucket = std::sync::atomic::AtomicUsize::new(0);
+        let bucket_locks: Vec<std::sync::Mutex<Vec<String>>> =
+            buckets.into_iter().map(std::sync::Mutex::new).collect();
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(32);
+        std::thread::scope(|s| {
+            for _ in 0..n_threads {
+                let next_bucket = &next_bucket;
+                let bucket_locks = &bucket_locks;
+                s.spawn(move || loop {
+                    let idx = next_bucket.fetch_add(1, Ordering::Relaxed);
+                    if idx >= 256 {
+                        break;
+                    }
+                    let mut b = bucket_locks[idx].lock().unwrap();
+                    if b.len() > 1 {
+                        b.sort_unstable();
+                    }
+                });
+            }
+        });
+        let mut paths = Vec::with_capacity(total);
+        for lock in bucket_locks {
+            paths.append(&mut lock.into_inner().unwrap());
+        }
         paths
     })
     .await?)
@@ -208,8 +287,9 @@ fn spawn_index_rebuild(app: AppState) {
 
 /// Current file index, stale-while-revalidate (see IndexState). Builds are
 /// single-flight and detached; cold requests (including the one that starts
-/// the build) wait for completion.
-async fn file_index(app: &AppState) -> Result<Arc<Vec<String>>, AppError> {
+/// the build) wait for completion. Also returns whether a background refresh
+/// is currently in flight so the client can re-query once it finishes.
+async fn file_index(app: &AppState) -> Result<(Arc<Vec<String>>, bool), AppError> {
     loop {
         let notified = {
             let mut st = app.index.lock().await;
@@ -219,7 +299,7 @@ async fn file_index(app: &AppState) -> Result<Arc<Vec<String>>, AppError> {
                     st.refreshing = true;
                     spawn_index_rebuild(app.clone());
                 }
-                return Ok(paths); // possibly stale; refresh runs detached
+                return Ok((paths, st.refreshing)); // possibly stale; refresh runs detached
             }
             if !st.refreshing {
                 if let Some(e) = st.last_error.take() {
@@ -240,6 +320,13 @@ async fn file_index(app: &AppState) -> Result<Arc<Vec<String>>, AppError> {
     }
 }
 
+struct AbortOnDrop(Arc<AtomicBool>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Fuzzy file search: top-N nucleo matches over the index; empty query lists
 /// the first N paths. The full list never leaves the server.
 async fn api_files(
@@ -253,25 +340,101 @@ async fn api_files(
         .unwrap_or(200)
         .min(1000);
 
-    let paths = file_index(&app).await?;
-    let results: Vec<String> = if q.is_empty() {
+    let (paths, refreshing) = file_index(&app).await?;
+    let results: Vec<String> = if q.is_empty() || limit == 0 {
         paths.iter().take(limit).cloned().collect()
     } else {
-        tokio::task::spawn_blocking(move || {
-            let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+        let seq = app.search_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let aborted = Arc::new(AtomicBool::new(false));
+        let _abort_guard = AbortOnDrop(aborted.clone());
+        let app_for_task = app.clone();
+
+        let maybe_results = tokio::task::spawn_blocking(move || {
             let pattern = Pattern::parse(&q, CaseMatching::Ignore, Normalization::Smart);
-            pattern
-                .match_list(paths.iter(), &mut matcher)
-                .into_iter()
-                .take(limit)
-                .map(|(p, _)| p.clone())
-                .collect()
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(paths.len().max(1));
+            let chunk_size = paths.len().div_ceil(n_threads);
+            let cmp = |&(sa, ia): &(u32, usize), &(sb, ib): &(u32, usize)| {
+                sb.cmp(&sa).then_with(|| ia.cmp(&ib))
+            };
+
+            let partials: Vec<Vec<(u32, usize)>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(n_threads);
+                for (t_idx, slice) in paths.chunks(chunk_size).enumerate() {
+                    let base = t_idx * chunk_size;
+                    let pattern = &pattern;
+                    let aborted = &aborted;
+                    let search_seq = &app_for_task.search_seq;
+                    handles.push(s.spawn(move || {
+                        let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+                        let mut buf = Vec::new();
+                        let mut top: Vec<(u32, usize)> = Vec::with_capacity(limit * 2);
+                        for (b_idx, batch) in slice.chunks(2048).enumerate() {
+                            if aborted.load(Ordering::Relaxed)
+                                || search_seq.load(Ordering::Relaxed) != seq
+                            {
+                                return Vec::new();
+                            }
+                            let batch_base = base + b_idx * 2048;
+                            for (i, p) in batch.iter().enumerate() {
+                                if let Some(score) =
+                                    pattern.score(Utf32Str::new(p, &mut buf), &mut matcher)
+                                {
+                                    top.push((score, batch_base + i));
+                                    if top.len() >= limit * 4 {
+                                        top.select_nth_unstable_by(limit, cmp);
+                                        top.truncate(limit);
+                                    }
+                                }
+                            }
+                        }
+                        if top.len() > limit {
+                            top.select_nth_unstable_by(limit, cmp);
+                            top.truncate(limit);
+                        }
+                        top
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            if aborted.load(Ordering::Relaxed)
+                || app_for_task.search_seq.load(Ordering::Relaxed) != seq
+            {
+                return None;
+            }
+
+            let mut merged: Vec<(u32, usize)> = partials.into_iter().flatten().collect();
+            if merged.len() > limit {
+                merged.select_nth_unstable_by(limit, cmp);
+                merged.truncate(limit);
+            }
+            merged.sort_unstable_by(cmp);
+            Some(
+                merged
+                    .into_iter()
+                    .map(|(_, idx)| paths[idx].clone())
+                    .collect::<Vec<String>>(),
+            )
         })
-        .await?
+        .await?;
+
+        match maybe_results {
+            Some(r) => r,
+            None => return Ok(StatusCode::NO_CONTENT.into_response()),
+        }
     };
 
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (
+                axum::http::HeaderName::from_static("x-index-refreshing"),
+                if refreshing { "1" } else { "0" },
+            ),
+        ],
         serde_json::to_string(&results)?,
     )
         .into_response())
@@ -567,17 +730,26 @@ const INDEX_JS: &str = r#"
   const counts = new Map(entries.map(e => [e.path, e.comments.length]));
 
   let seq = 0;
+  let ctrl = null;
+  let retryTimer = null;
   async function refresh() {
     const cur = ++seq;
-    let paths;
+    if (ctrl) ctrl.abort();
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    ctrl = new AbortController();
+    let paths, refreshing = false;
     try {
-      const res = await fetch('/api/files?q=' + encodeURIComponent(q.value));
+      const res = await fetch('/api/files?q=' + encodeURIComponent(q.value), {
+        signal: ctrl.signal,
+      });
       if (!res.ok) throw new Error(res.status);
+      refreshing = res.headers.get('x-index-refreshing') === '1';
       paths = await res.json();
     } catch {
       return;
     }
     if (cur !== seq) return; // a newer query superseded this one
+    if (refreshing) retryTimer = setTimeout(refresh, 400);
     list.textContent = '';
     for (const p of paths) {
       const li = document.createElement('li');
